@@ -22,7 +22,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: darwin-aarch64
             ext: ""
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             artifact: darwin-x86_64
             ext: ""
