@@ -4,6 +4,8 @@
 [![Frontend](https://img.shields.io/badge/React-18-blue.svg)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+**[English](README-en.md)** | 中文
+
 面向 [new-api](https://github.com/Calcium-Ion/new-api) 的独立统计看板，提供用户、模型、渠道维度的 API 调用统计与质量监控。前端静态资源在编译期嵌入后端二进制，部署时仅需一个可执行文件。
 
 ## 功能特性
