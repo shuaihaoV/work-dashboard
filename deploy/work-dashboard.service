@@ -1,0 +1,50 @@
+[Unit]
+Description=Work Dashboard Service (NewAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=work-dashboard
+Group=work-dashboard
+WorkingDirectory=/opt/work-dashboard
+# 主数据库连接（必填，PostgreSQL）
+Environment="WORK_DASHBOARD_DATABASE_URL=postgres://user:password@127.0.0.1:5432/newapi"
+
+# 日志数据库连接（可选，默认与主库相同；new-api LOG_SQL_DSN 分库时需配置）
+# Environment="WORK_DASHBOARD_LOG_DATABASE_URL=postgres://user:password@127.0.0.1:5432/newapi-logs"
+
+# 服务监听地址（可选，默认 0.0.0.0:18088）
+Environment="WORK_DASHBOARD_BIND=0.0.0.0:18088"
+
+# 缓存秒数（可选，默认 60）
+Environment="WORK_DASHBOARD_CACHE_TTL_SECONDS=60"
+
+# 子路径部署前缀（可选，默认 /）
+Environment="WORK_DASHBOARD_BASE_PATH=/work-dashboard"
+
+# 运行时无效，仅构建阶段 build.rs 使用；保留在此便于配置统一
+Environment="WORK_DASHBOARD_SKIP_FRONTEND_BUILD=false"
+
+# 启动命令（按实际二进制路径调整）
+ExecStart=/opt/work-dashboard/work-dashboard
+
+Restart=always
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillMode=mixed
+
+# 安全/资源限制
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LimitNOFILE=65535
+
+# 日志输出到 journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

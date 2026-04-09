@@ -1,0 +1,26 @@
+# Rust / Cargo
+backend/target/
+
+# Node.js / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/tailwind.config.js
+frontend/tailwind.config.d.ts
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
