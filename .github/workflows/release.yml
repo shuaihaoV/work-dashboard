@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: linux-x86_64
+            ext: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: linux-aarch64
+            ext: ""
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            artifact: darwin-aarch64
+            ext: ""
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            artifact: darwin-x86_64
+            ext: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x86_64
+            ext: ".exe"
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        run: pnpm --dir frontend install && pnpm --dir frontend build
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Build backend
+        run: cargo build --release --manifest-path backend/Cargo.toml --target ${{ matrix.target }}
+        env:
+          WORK_DASHBOARD_SKIP_FRONTEND_BUILD: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: work-dashboard-${{ github.ref_name }}-${{ matrix.artifact }}
+          path: backend/target/${{ matrix.target }}/release/work-dashboard${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Rename artifacts
+        run: |
+          mkdir release-assets
+          for dir in artifacts/work-dashboard-*; do
+            name=$(basename "$dir")
+            if [ -f "$dir/work-dashboard" ]; then
+              mv "$dir/work-dashboard" "release-assets/$name"
+            elif [ -f "$dir/work-dashboard.exe" ]; then
+              mv "$dir/work-dashboard.exe" "release-assets/$name.exe"
+            fi
+          done
+          ls -la release-assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
