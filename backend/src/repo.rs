@@ -31,15 +31,38 @@ const LOG_TYPE_ERROR: i64 = 5;
 const CACHE_TOKENS_EXPR: &str = "COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)";
 
 // Real total input tokens, handling provider differences:
-//   Anthropic: prompt_tokens excludes cache; total = prompt + creation + cache_read
-//   OpenAI:    prompt_tokens already includes cache; total = prompt
+//
+// ── Claude (direct Anthropic, non-OpenRouter) ──
+//   prompt_tokens = Anthropic input_tokens = new_text + cache_creation
+//   (does NOT include cache_read / cache_tokens)
+//   → Total input = prompt_tokens + cache_tokens
+//
+// ── Claude (via OpenRouter) ──
+//   new-api OpenRouter billing already subtracts both cache_read and cache_creation
+//   from prompt_tokens before storing, so neither is included.
+//   → Total input = prompt_tokens + cache_tokens + cache_creation_tokens
+//   However this case is indistinguishable from the previous one without joining
+//   the channels table. We deliberately omit cache_creation_tokens for ALL Claude
+//   modes to avoid double-counting the far more common direct-Claude case.
+//   For OpenRouter the undercount is only cache_creation (typically tiny).
+//
+// ── Non-Claude with cache_creation_tokens (rare) ──
+//   Some providers report cache_creation_tokens separately and they are NOT
+//   included in prompt_tokens. Add them together with cache_tokens.
+//
+// ── Standard (OpenAI-like) ──
+//   prompt_tokens already includes all input (including cache hits).
+//   → Total input = prompt_tokens
+//
 const REAL_INPUT_EXPR: &str = concat!(
     "CASE WHEN ",
+    // Claude-like: prompt_tokens excludes cache_read but includes cache_creation
     "(NULLIF(other, '')::json->>'claude')::boolean IS TRUE",
-    " OR (NULLIF(other, '')::json->>'cache_creation_tokens') IS NOT NULL",
     " OR COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0) > prompt_tokens",
-    " OR (COALESCE((NULLIF(other, '')::json->>'cache_ratio')::numeric, 1) < 0.5",
-    "     AND COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0) > 0)",
+    " THEN prompt_tokens",
+    "   + COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)",
+    // Non-Claude with cache_creation (rare): assume they are NOT in prompt_tokens
+    " WHEN (NULLIF(other, '')::json->>'cache_creation_tokens') IS NOT NULL",
     " THEN prompt_tokens",
     "   + COALESCE((NULLIF(other, '')::json->>'cache_creation_tokens')::bigint, 0)",
     "   + COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)",
@@ -199,7 +222,10 @@ pub async fn fetch_user_stats(
         r#"
 SELECT
     user_id,
-    COALESCE(MAX(username), '#' || user_id::text) AS user_name,
+    COALESCE(
+        (ARRAY_AGG(username ORDER BY created_at DESC) FILTER (WHERE NULLIF(username, '') IS NOT NULL))[1],
+        '#' || user_id::text
+    ) AS user_name,
     COUNT(*)::bigint AS total_requests,
     COUNT(*) FILTER (WHERE type = $3)::bigint AS success_count,
     COALESCE(SUM({real_input}) FILTER (WHERE type = $3), 0)::bigint AS input_tokens,
@@ -272,7 +298,10 @@ pub async fn search_users(
 WITH ranked_users AS (
     SELECT
         user_id,
-        COALESCE(MAX(NULLIF(username, '')), '#' || user_id::text) AS user_name,
+        COALESCE(
+            (ARRAY_AGG(username ORDER BY created_at DESC) FILTER (WHERE NULLIF(username, '') IS NOT NULL))[1],
+            '#' || user_id::text
+        ) AS user_name,
         COUNT(*)::bigint AS request_count,
         MAX(created_at)::bigint AS last_seen_at
     FROM logs
