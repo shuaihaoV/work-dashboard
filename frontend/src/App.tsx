@@ -1,6 +1,16 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Activity, Database, Gauge, Sparkles, Users } from 'lucide-react';
+import { Activity, BarChart3, Database, Gauge, Sparkles, Users } from 'lucide-react';
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Line,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 
 import {
   fetchChannelOptions,
@@ -216,6 +226,11 @@ function App() {
 
         <OverviewSection data={overviewQuery.data} loading={overviewQuery.isLoading} />
 
+        <UserChartSection
+          loading={userQuery.isLoading}
+          rows={userQuery.data?.data ?? []}
+        />
+
         <StatsTableSection
           title="用户统计"
           description="按时间范围查看用户请求量、成功率和 Token 消耗"
@@ -331,7 +346,11 @@ function OverviewSection({ data, loading }: { data?: ApiResponse<OverviewStats>;
       />
       <MetricCard
         title="缓存 Token"
-        value={loading && !overview ? '加载中...' : formatTokenCompact(overview?.totalCachedTokens ?? 0)}
+        value={
+          loading && !overview
+            ? '加载中...'
+            : `${formatTokenCompact(overview?.totalCachedTokens ?? 0)} / ${formatCacheRate(overview?.totalCachedTokens ?? 0, overview?.totalInputTokens ?? 0)}`
+        }
         icon={<Sparkles className="h-4 w-4" />}
       />
       <MetricCard
@@ -511,6 +530,157 @@ function StatusBadge({ status }: { status: string }) {
     return <Badge variant="danger">自动禁用</Badge>;
   }
   return <Badge variant="outline">未知</Badge>;
+}
+
+// 用于图表展示的数据结构（去掉延迟和成功率）
+interface UserChartRow {
+  userName: string;
+  totalRequests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+}
+
+const CHART_COLORS = {
+  requests: '#3b82f6',   // blue-500
+  input: '#22c55e',      // green-500
+  output: '#f59e0b',     // amber-500
+  cached: '#8b5cf6',     // violet-500
+} as const;
+
+const CHART_NAME_MAP: Record<string, string> = {
+  inputTokens: '输入 Token',
+  outputTokens: '输出 Token',
+  cachedTokens: '缓存 Token',
+  requests: '请求数'
+};
+
+/** 自定义 Tooltip，适配亮色/暗色主题 */
+function ChartTooltip({
+  active,
+  payload,
+  label,
+}: {
+  active?: boolean;
+  payload?: Array<{ name: string; value: number; color: string }>;
+  label?: string;
+}) {
+  if (!active || !payload || payload.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-border bg-card px-3 py-2 shadow-lg text-sm">
+      <p className="mb-1 font-medium text-foreground">用户: {label}</p>
+      {payload.map((entry) => (
+        <div key={entry.name} className="flex items-center gap-2">
+          <span
+            className="inline-block h-2.5 w-2.5 rounded-sm"
+            style={{ backgroundColor: entry.color }}
+          />
+          <span className="text-muted-foreground">{CHART_NAME_MAP[entry.name] ?? entry.name}:</span>
+          <span className="font-medium text-foreground">
+            {entry.name === 'requests'
+              ? formatInt(entry.value)
+              : formatTokenCompact(entry.value)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function UserChartSection({ loading, rows }: { loading: boolean; rows: UserStatsItem[] }) {
+  // 取前 15 名用户，按请求数降序
+  const chartData: UserChartRow[] = useMemo(() => {
+    return [...rows]
+      .sort((a, b) => b.totalRequests - a.totalRequests)
+      .slice(0, 15)
+      .map((row) => ({
+        userName: row.userName,
+        totalRequests: row.totalRequests,
+        inputTokens: row.inputTokens,
+        outputTokens: row.outputTokens,
+        cachedTokens: row.cachedTokens,
+      }));
+  }, [rows]);
+
+  const formatTokenAxis = (value: number) => formatTokenCompact(value);
+  const formatRequestAxis = (value: number) => formatInt(value);
+
+  if (!loading && chartData.length === 0) {
+    return null;
+  }
+
+  // 共用的 X 轴配置
+  const xAxis = (
+    <XAxis
+      dataKey="userName"
+      tick={{ fontSize: 15 }}
+      angle={-35}
+      textAnchor="end"
+      height={95}
+      interval={0}
+    />
+  );
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-lg md:text-xl">
+          <BarChart3 className="h-4 w-4" /> 统计总览
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {loading && chartData.length === 0 ? (
+          <div className="flex h-[350px] items-center justify-center text-muted-foreground">
+            加载中...
+          </div>
+        ) : (
+          <div className="flex flex-col gap-6">
+            {/* 请求数（柱状图）+ 输入 Token（折线图） */}
+            <ResponsiveContainer width="100%" height={350}>
+                <ComposedChart data={chartData} margin={{ top: 8, right: 8, left: 8, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  {xAxis}
+                  <YAxis
+                    yAxisId="requests"
+                    orientation="left"
+                    tickFormatter={formatRequestAxis}
+                    tick={{ fontSize: 13 }}
+                    width={65}
+                    stroke={CHART_COLORS.requests}
+                  />
+                  <YAxis
+                    yAxisId="tokens"
+                    orientation="right"
+                    tickFormatter={formatTokenAxis}
+                    tick={{ fontSize: 13 }}
+                    width={70}
+                    stroke={CHART_COLORS.input}
+                  />
+                  <Tooltip content={<ChartTooltip />} />
+                  <Bar
+                    yAxisId="requests"
+                    dataKey="totalRequests"
+                    name="requests"
+                    fill={CHART_COLORS.requests}
+                    radius={[4, 4, 0, 0]}
+                    barSize={20}
+                  />
+                  <Line
+                    yAxisId="tokens"
+                    type="monotone"
+                    dataKey="inputTokens"
+                    name="inputTokens"
+                    stroke={CHART_COLORS.input}
+                    strokeWidth={2}
+                    dot={{ r: 3 }}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 function ExtraSection({ data, loading }: { data?: ApiResponse<ExtraStats>; loading: boolean }) {
