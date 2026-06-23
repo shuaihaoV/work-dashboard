@@ -1,9 +1,11 @@
 export interface DateTimeRangeQuery {
   from: string;
   to: string;
-  userId?: number | null;
-  modelId?: string | null;
-  channelId?: number | null;
+  userId?: number[] | null;
+  modelId?: string[] | null;
+  channelId?: number[] | null;
+  tokenName?: string[] | null;
+  group?: string[] | null;
 }
 
 function getBasePath(): string {
@@ -31,6 +33,8 @@ export interface OverviewStats {
   totalOutputTokens: number;
   totalCachedTokens: number;
   totalQuota: number;
+  avgLatencyMs: number | null;
+  avgFrtMs: number | null;
 }
 
 export interface UserStatsItem {
@@ -115,19 +119,68 @@ export interface ExtraStats {
   topRequestedModels: TopRequestedModel[];
 }
 
+export interface TimeseriesPoint {
+  bucketTs: number;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  avgLatencyMs: number | null;
+}
+
+export interface TokenStatsItem {
+  tokenName: string;
+  totalRequests: number;
+  successRate: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  avgLatencyMs: number | null;
+}
+
+export interface TokenOptionItem {
+  tokenName: string;
+}
+
+export interface PerfMetricStats {
+  modelName: string;
+  requestCount: number;
+  successRate: number;
+  avgLatencyMs: number | null;
+  avgTtftMs: number | null;
+  outputTokens: number;
+  generationSpeedTps: number | null;
+}
+
 async function request<T>(path: string, range: DateTimeRangeQuery): Promise<ApiResponse<T>> {
   const params = new URLSearchParams({
     from: range.from,
     to: range.to,
   });
-  if (range.userId != null) {
-    params.set('userId', String(range.userId));
+  if (range.userId && range.userId.length > 0) {
+    for (const id of range.userId) {
+      params.append('userId', String(id));
+    }
   }
-  if (range.modelId) {
-    params.set('modelId', range.modelId);
+  if (range.modelId && range.modelId.length > 0) {
+    for (const name of range.modelId) {
+      params.append('modelId', name);
+    }
   }
-  if (range.channelId != null) {
-    params.set('channelId', String(range.channelId));
+  if (range.channelId && range.channelId.length > 0) {
+    for (const id of range.channelId) {
+      params.append('channelId', String(id));
+    }
+  }
+  if (range.tokenName && range.tokenName.length > 0) {
+    for (const name of range.tokenName) {
+      params.append('tokenName', name);
+    }
+  }
+  if (range.group && range.group.length > 0) {
+    for (const name of range.group) {
+      params.append('group', name);
+    }
   }
   const response = await fetch(`${withBasePath(path)}?${params.toString()}`);
   if (!response.ok) {
@@ -187,4 +240,58 @@ async function fetchLookupOptions<T>(path: string, keyword: string): Promise<Api
     throw new Error(`Request failed (${response.status}): ${text}`);
   }
   return (await response.json()) as ApiResponse<T[]>;
+}
+
+export async function fetchTimeseries(
+  range: DateTimeRangeQuery,
+  granularity: 'hour' | 'day',
+): Promise<ApiResponse<TimeseriesPoint[]>> {
+  const params = new URLSearchParams({
+    from: range.from,
+    to: range.to,
+    granularity,
+  });
+  if (range.userId && range.userId.length > 0) {
+    for (const id of range.userId) {
+      params.append('userId', String(id));
+    }
+  }
+  if (range.modelId && range.modelId.length > 0) {
+    for (const name of range.modelId) {
+      params.append('modelId', name);
+    }
+  }
+  if (range.channelId && range.channelId.length > 0) {
+    for (const id of range.channelId) {
+      params.append('channelId', String(id));
+    }
+  }
+  if (range.tokenName && range.tokenName.length > 0) {
+    for (const name of range.tokenName) {
+      params.append('tokenName', name);
+    }
+  }
+  if (range.group && range.group.length > 0) {
+    for (const name of range.group) {
+      params.append('group', name);
+    }
+  }
+  const response = await fetch(`${withBasePath('/api/v1/stats/timeseries')}?${params.toString()}`);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Request failed (${response.status}): ${text}`);
+  }
+  return (await response.json()) as ApiResponse<TimeseriesPoint[]>;
+}
+
+export function fetchTokenStats(range: DateTimeRangeQuery) {
+  return request<TokenStatsItem[]>('/api/v1/stats/tokens', range);
+}
+
+export async function fetchTokenOptions(keyword: string): Promise<ApiResponse<TokenOptionItem[]>> {
+  return fetchLookupOptions<TokenOptionItem>('/api/v1/tokens/search', keyword);
+}
+
+export function fetchPerfMetrics(range: DateTimeRangeQuery) {
+  return request<PerfMetricStats[]>('/api/v1/stats/perf', range);
 }

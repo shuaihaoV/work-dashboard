@@ -39,7 +39,10 @@ impl IntoResponse for AppError {
         };
 
         let payload = ErrorPayload {
-            error: self.to_string(),
+            error: match self {
+                Self::Database(_) => "internal server error".to_string(),
+                _ => self.to_string(),
+            },
         };
 
         (status, Json(payload)).into_response()
