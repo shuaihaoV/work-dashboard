@@ -22,7 +22,7 @@
 ├── .github/workflows/
 │   ├── ci.yml              # PR: frontend tsc-check + backend cargo-check
 │   └── release.yml         # tag v*: 5 平台交叉编译 → GitHub Release
-├── CLAUDE.md               # Claude Code 项目指引（约定权威来源）
+└── 见各目录下的 AGENTS.md    # AI 协作知识库
 └── README.md / README-en.md
 ```
 

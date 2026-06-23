@@ -189,7 +189,7 @@ Set `WORK_DASHBOARD_BASE_PATH=/work-dashboard` when starting the server.
 │   └── package.json
 ├── deploy/
 │   └── work-dashboard.service  # systemd example
-└── CLAUDE.md                   # Claude Code project guide
+└── AGENTS.md                   # AI collaboration knowledge base
 ```
 
 ## Security Notes

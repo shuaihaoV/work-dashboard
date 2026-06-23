@@ -92,9 +92,13 @@ cargo build --release --manifest-path backend/Cargo.toml
 | GET | `/stats/models` | 模型维度统计 |
 | GET | `/stats/raw-models` | 模型 × 渠道交叉统计 |
 | GET | `/stats/extra` | Top 排行（高吞吐渠道、高频模型） |
+| GET | `/stats/timeseries` | 时间趋势数据（按小时/天聚合） |
+| GET | `/stats/tokens` | 令牌维度统计 |
+| GET | `/stats/perf` | 性能指标（TTFT、延迟、生成速度） |
 | GET | `/users/search?q=` | 用户搜索（下拉选项） |
 | GET | `/models/search?q=` | 模型搜索 |
 | GET | `/channels/search?q=` | 渠道搜索 |
+| GET | `/tokens/search?q=` | 令牌搜索 |
 | GET | `/healthz` | 健康检查 |
 
 统计端点查询参数：
@@ -189,7 +193,7 @@ server {
 │   └── package.json
 ├── deploy/
 │   └── work-dashboard.service  # systemd 示例
-└── CLAUDE.md                   # Claude Code 项目指引
+└── AGENTS.md                   # AI 协作知识库
 ```
 
 ## 安全注意事项
