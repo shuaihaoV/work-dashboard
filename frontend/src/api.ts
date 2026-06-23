@@ -159,27 +159,27 @@ async function request<T>(path: string, range: DateTimeRangeQuery): Promise<ApiR
   });
   if (range.userId && range.userId.length > 0) {
     for (const id of range.userId) {
-      params.append('userId', String(id));
+      params.append('userId[]', String(id));
     }
   }
   if (range.modelId && range.modelId.length > 0) {
     for (const name of range.modelId) {
-      params.append('modelId', name);
+      params.append('modelId[]', name);
     }
   }
   if (range.channelId && range.channelId.length > 0) {
     for (const id of range.channelId) {
-      params.append('channelId', String(id));
+      params.append('channelId[]', String(id));
     }
   }
   if (range.tokenName && range.tokenName.length > 0) {
     for (const name of range.tokenName) {
-      params.append('tokenName', name);
+      params.append('tokenName[]', name);
     }
   }
   if (range.group && range.group.length > 0) {
     for (const name of range.group) {
-      params.append('group', name);
+      params.append('group[]', name);
     }
   }
   const response = await fetch(`${withBasePath(path)}?${params.toString()}`);
@@ -253,27 +253,27 @@ export async function fetchTimeseries(
   });
   if (range.userId && range.userId.length > 0) {
     for (const id of range.userId) {
-      params.append('userId', String(id));
+      params.append('userId[]', String(id));
     }
   }
   if (range.modelId && range.modelId.length > 0) {
     for (const name of range.modelId) {
-      params.append('modelId', name);
+      params.append('modelId[]', name);
     }
   }
   if (range.channelId && range.channelId.length > 0) {
     for (const id of range.channelId) {
-      params.append('channelId', String(id));
+      params.append('channelId[]', String(id));
     }
   }
   if (range.tokenName && range.tokenName.length > 0) {
     for (const name of range.tokenName) {
-      params.append('tokenName', name);
+      params.append('tokenName[]', name);
     }
   }
   if (range.group && range.group.length > 0) {
     for (const name of range.group) {
-      params.append('group', name);
+      params.append('group[]', name);
     }
   }
   const response = await fetch(`${withBasePath('/api/v1/stats/timeseries')}?${params.toString()}`);
