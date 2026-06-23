@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -6,20 +6,35 @@ use sqlx::{FromRow, PgPool};
 use crate::error::AppError;
 use crate::models::{
     ChannelOptionItem, ChannelStatsItem, ExtraStats, ModelOptionItem, ModelStatsItem,
-    OverviewStats, RawModelStatsItem, TopRequestedModel, TopThroughputChannel, UserOptionItem,
-    UserStatsItem,
+    OverviewStats, PerfMetricStats, RawModelStatsItem, TimeseriesPoint, TokenOptionItem,
+    TokenStatsItem, TopRequestedModel, TopThroughputChannel, UserOptionItem, UserStatsItem,
 };
 
 #[derive(Debug, Clone, Default)]
 pub struct StatsFilter {
-    pub user_id: Option<i64>,
-    pub model_name: Option<String>,
-    pub channel_id: Option<i64>,
+    pub user_ids: Option<Vec<i64>>,
+    pub model_names: Option<Vec<String>>,
+    pub channel_ids: Option<Vec<i64>>,
+    pub token_names: Option<Vec<String>>,
+    pub groups: Option<Vec<String>>,
 }
 
 impl StatsFilter {
-    fn model_name(&self) -> Option<&str> {
-        self.model_name.as_deref()
+    /// Returns None if the vec is empty, so sqlx binds NULL (no filter).
+    fn user_ids(&self) -> Option<Vec<i64>> {
+        self.user_ids.as_ref().filter(|v| !v.is_empty()).cloned()
+    }
+    fn model_names(&self) -> Option<Vec<String>> {
+        self.model_names.as_ref().filter(|v| !v.is_empty()).cloned()
+    }
+    fn channel_ids(&self) -> Option<Vec<i64>> {
+        self.channel_ids.as_ref().filter(|v| !v.is_empty()).cloned()
+    }
+    fn token_names(&self) -> Option<Vec<String>> {
+        self.token_names.as_ref().filter(|v| !v.is_empty()).cloned()
+    }
+    fn groups(&self) -> Option<Vec<String>> {
+        self.groups.as_ref().filter(|v| !v.is_empty()).cloned()
     }
 }
 
@@ -29,22 +44,19 @@ const LOG_TYPE_ERROR: i64 = 5;
 
 // SQL fragment to extract cache_tokens (read) from the `other` JSON text field
 const CACHE_TOKENS_EXPR: &str = "COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)";
+const FRT_EXPR: &str = "(NULLIF(other, '')::json->>'frt')::double precision";
 
 // Real total input tokens, handling provider differences:
+//
+// ── OpenRouter Claude ──
+//   new-api OpenRouter billing subtracts both cache_read AND cache_creation
+//   from prompt_tokens before storing. Both must be added back.
+//   → Total input = prompt_tokens + cache_tokens + cache_creation_tokens
 //
 // ── Claude (direct Anthropic, non-OpenRouter) ──
 //   prompt_tokens = Anthropic input_tokens = new_text + cache_creation
 //   (does NOT include cache_read / cache_tokens)
 //   → Total input = prompt_tokens + cache_tokens
-//
-// ── Claude (via OpenRouter) ──
-//   new-api OpenRouter billing already subtracts both cache_read and cache_creation
-//   from prompt_tokens before storing, so neither is included.
-//   → Total input = prompt_tokens + cache_tokens + cache_creation_tokens
-//   However this case is indistinguishable from the previous one without joining
-//   the channels table. We deliberately omit cache_creation_tokens for ALL Claude
-//   modes to avoid double-counting the far more common direct-Claude case.
-//   For OpenRouter the undercount is only cache_creation (typically tiny).
 //
 // ── Non-Claude with cache_creation_tokens (rare) ──
 //   Some providers report cache_creation_tokens separately and they are NOT
@@ -54,21 +66,28 @@ const CACHE_TOKENS_EXPR: &str = "COALESCE((NULLIF(other, '')::json->>'cache_toke
 //   prompt_tokens already includes all input (including cache hits).
 //   → Total input = prompt_tokens
 //
-const REAL_INPUT_EXPR: &str = concat!(
-    "CASE WHEN ",
-    // Claude-like: prompt_tokens excludes cache_read but includes cache_creation
-    "(NULLIF(other, '')::json->>'claude')::boolean IS TRUE",
-    " OR COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0) > prompt_tokens",
-    " THEN prompt_tokens",
-    "   + COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)",
-    // Non-Claude with cache_creation (rare): assume they are NOT in prompt_tokens
-    " WHEN (NULLIF(other, '')::json->>'cache_creation_tokens') IS NOT NULL",
-    " THEN prompt_tokens",
-    "   + COALESCE((NULLIF(other, '')::json->>'cache_creation_tokens')::bigint, 0)",
-    "   + COALESCE((NULLIF(other, '')::json->>'cache_tokens')::bigint, 0)",
-    " ELSE prompt_tokens",
-    " END",
-);
+// openrouter_idx is the $N parameter index for the OpenRouter channel ID array.
+fn build_real_input_expr(openrouter_idx: usize) -> String {
+    let cached = CACHE_TOKENS_EXPR;
+    format!(
+        "CASE \
+         WHEN channel_id = ANY(${openrouter_idx}::bigint[]) \
+           AND (NULLIF(other,'')::json->>'claude')::boolean IS TRUE \
+         THEN prompt_tokens \
+           + COALESCE({cached}, 0) \
+           + COALESCE((NULLIF(other,'')::json->>'cache_creation_tokens')::bigint, 0) \
+         WHEN (NULLIF(other,'')::json->>'claude')::boolean IS TRUE \
+           OR COALESCE({cached}, 0) > prompt_tokens \
+         THEN prompt_tokens \
+           + COALESCE({cached}, 0) \
+         WHEN (NULLIF(other,'')::json->>'cache_creation_tokens') IS NOT NULL \
+         THEN prompt_tokens \
+           + COALESCE((NULLIF(other,'')::json->>'cache_creation_tokens')::bigint, 0) \
+           + COALESCE({cached}, 0) \
+         ELSE prompt_tokens \
+         END"
+    )
+}
 
 fn channel_type_name(type_id: i64) -> &'static str {
     match type_id {
@@ -135,6 +154,8 @@ struct OverviewRow {
     total_output_tokens: i64,
     total_cached_tokens: i64,
     total_quota: i64,
+    avg_latency_ms: Option<f64>,
+    avg_frt_ms: Option<f64>,
 }
 
 pub async fn fetch_overview(
@@ -142,6 +163,7 @@ pub async fn fetch_overview(
     period_start_utc: DateTime<Utc>,
     period_end_utc: DateTime<Utc>,
     filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
 ) -> Result<OverviewStats, AppError> {
     let start_ts = period_start_utc.timestamp();
     let end_ts = period_end_utc.timestamp();
@@ -154,27 +176,36 @@ SELECT
     COALESCE(SUM({real_input}) FILTER (WHERE type = $3), 0)::bigint AS total_input_tokens,
     COALESCE(SUM(completion_tokens) FILTER (WHERE type = $3), 0)::bigint AS total_output_tokens,
     COALESCE(SUM({cached}) FILTER (WHERE type = $3), 0)::bigint AS total_cached_tokens,
-    COALESCE(SUM(quota) FILTER (WHERE type = $3), 0)::bigint AS total_quota
+    COALESCE(SUM(quota) FILTER (WHERE type = $3), 0)::bigint AS total_quota,
+    AVG(use_time * 1000.0) FILTER (WHERE type = $3 AND use_time > 0)::double precision AS avg_latency_ms,
+    AVG({frt}) FILTER (WHERE {frt} IS NOT NULL) AS avg_frt_ms
 FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type IN ($3, $4)
-  AND ($5::bigint IS NULL OR user_id = $5)
-  AND ($6::text IS NULL OR model_name = $6)
-  AND ($7::bigint IS NULL OR channel_id = $7)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
 "#,
         cached = CACHE_TOKENS_EXPR,
-        real_input = REAL_INPUT_EXPR
+        real_input = build_real_input_expr(8),
+        frt = FRT_EXPR,
     );
 
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
     let row = sqlx::query_as::<_, OverviewRow>(&sql)
         .bind(start_ts)
         .bind(end_ts)
         .bind(LOG_TYPE_CONSUME)
         .bind(LOG_TYPE_ERROR)
-        .bind(filter.user_id)
-        .bind(filter.model_name())
-        .bind(filter.channel_id)
+        .bind(filter.user_ids())
+        .bind(filter.model_names())
+        .bind(filter.channel_ids())
+        .bind(&ids)
+        .bind(filter.token_names())
+        .bind(filter.groups())
         .fetch_one(log_pool)
         .await?;
 
@@ -191,6 +222,8 @@ WHERE created_at >= $1
         total_output_tokens: row.total_output_tokens,
         total_cached_tokens: row.total_cached_tokens,
         total_quota: row.total_quota,
+        avg_latency_ms: row.avg_latency_ms,
+        avg_frt_ms: row.avg_frt_ms,
     })
 }
 
@@ -214,6 +247,7 @@ pub async fn fetch_user_stats(
     period_start_utc: DateTime<Utc>,
     period_end_utc: DateTime<Utc>,
     filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
 ) -> Result<Vec<UserStatsItem>, AppError> {
     let start_ts = period_start_utc.timestamp();
     let end_ts = period_end_utc.timestamp();
@@ -237,26 +271,32 @@ FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type IN ($3, $4)
-  AND ($5::bigint IS NULL OR user_id = $5)
-  AND ($6::text IS NULL OR model_name = $6)
-  AND ($7::bigint IS NULL OR channel_id = $7)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
 GROUP BY user_id
 HAVING COUNT(*) > 0
 ORDER BY total_requests DESC, output_tokens DESC
 LIMIT 200
 "#,
         cached = CACHE_TOKENS_EXPR,
-        real_input = REAL_INPUT_EXPR
+        real_input = build_real_input_expr(8),
     );
 
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
     let rows = sqlx::query_as::<_, UserStatsRow>(&sql)
         .bind(start_ts)
         .bind(end_ts)
         .bind(LOG_TYPE_CONSUME)
         .bind(LOG_TYPE_ERROR)
-        .bind(filter.user_id)
-        .bind(filter.model_name())
-        .bind(filter.channel_id)
+        .bind(filter.user_ids())
+        .bind(filter.model_names())
+        .bind(filter.channel_ids())
+        .bind(&ids)
+        .bind(filter.token_names())
+        .bind(filter.groups())
         .fetch_all(log_pool)
         .await?;
 
@@ -441,6 +481,147 @@ LIMIT 20
         .collect())
 }
 
+// ── Token Stats ──
+
+#[derive(Debug, FromRow)]
+struct TokenStatsRow {
+    token_name: String,
+    total_requests: i64,
+    success_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_tokens: i64,
+    avg_latency_ms: Option<f64>,
+}
+
+pub async fn fetch_token_stats(
+    log_pool: &PgPool,
+    period_start_utc: DateTime<Utc>,
+    period_end_utc: DateTime<Utc>,
+    filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
+) -> Result<Vec<TokenStatsItem>, AppError> {
+    let start_ts = period_start_utc.timestamp();
+    let end_ts = period_end_utc.timestamp();
+
+    let sql = format!(
+        r#"
+SELECT
+    token_name,
+    COUNT(*)::bigint AS total_requests,
+    COUNT(*) FILTER (WHERE type = $3)::bigint AS success_count,
+    COALESCE(SUM({real_input}) FILTER (WHERE type = $3), 0)::bigint AS input_tokens,
+    COALESCE(SUM(completion_tokens) FILTER (WHERE type = $3), 0)::bigint AS output_tokens,
+    COALESCE(SUM({cached}) FILTER (WHERE type = $3), 0)::bigint AS cached_tokens,
+    AVG(use_time * 1000.0) FILTER (WHERE type = $3 AND use_time > 0)::double precision AS avg_latency_ms
+FROM logs
+WHERE created_at >= $1
+  AND created_at < $2
+  AND type IN ($3, $4)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
+  AND token_name IS NOT NULL AND token_name <> ''
+GROUP BY token_name
+HAVING COUNT(*) > 0
+ORDER BY total_requests DESC, output_tokens DESC
+LIMIT 200
+"#,
+        cached = CACHE_TOKENS_EXPR,
+        real_input = build_real_input_expr(8),
+    );
+
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
+    let rows = sqlx::query_as::<_, TokenStatsRow>(&sql)
+        .bind(start_ts)
+        .bind(end_ts)
+        .bind(LOG_TYPE_CONSUME)
+        .bind(LOG_TYPE_ERROR)
+        .bind(filter.user_ids())
+        .bind(filter.model_names())
+        .bind(filter.channel_ids())
+        .bind(&ids)
+        .bind(filter.token_names())
+        .bind(filter.groups())
+        .fetch_all(log_pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let success_rate = if row.total_requests > 0 {
+                ((row.success_count as f64 / row.total_requests as f64) * 10000.0).round() / 100.0
+            } else {
+                0.0
+            };
+            TokenStatsItem {
+                token_name: row.token_name,
+                total_requests: row.total_requests,
+                success_rate,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                cached_tokens: row.cached_tokens,
+                avg_latency_ms: row.avg_latency_ms,
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, FromRow)]
+struct TokenOptionRow {
+    token_name: String,
+}
+
+pub async fn search_tokens(
+    log_pool: &PgPool,
+    keyword: Option<&str>,
+) -> Result<Vec<TokenOptionItem>, AppError> {
+    let rows = sqlx::query_as::<_, TokenOptionRow>(
+        r#"
+WITH ranked AS (
+    SELECT
+        token_name,
+        COUNT(*)::bigint AS request_count,
+        MAX(created_at)::bigint AS last_seen_at
+    FROM logs
+    WHERE token_name IS NOT NULL
+      AND token_name <> ''
+      AND (
+        $1::text IS NULL
+        OR token_name ILIKE '%' || $1 || '%'
+      )
+    GROUP BY token_name
+)
+SELECT
+    token_name
+FROM ranked
+ORDER BY
+    CASE
+        WHEN $1::text IS NOT NULL AND token_name = $1 THEN 0
+        WHEN $1::text IS NOT NULL AND token_name ILIKE $1 || '%' THEN 1
+        WHEN $1::text IS NOT NULL AND token_name ILIKE '%' || $1 || '%' THEN 2
+        ELSE 3
+    END,
+    last_seen_at DESC,
+    request_count DESC,
+    token_name ASC
+LIMIT 20
+"#,
+    )
+    .bind(keyword)
+    .fetch_all(log_pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TokenOptionItem {
+            token_name: row.token_name,
+        })
+        .collect())
+}
+
 // ── Channel Stats ──
 // logs from log_pool, channel info from main pool, merged in Rust
 
@@ -462,6 +643,7 @@ pub async fn fetch_channel_stats(
     period_start_utc: DateTime<Utc>,
     period_end_utc: DateTime<Utc>,
     filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
 ) -> Result<Vec<ChannelStatsItem>, AppError> {
     let start_ts = period_start_utc.timestamp();
     let end_ts = period_end_utc.timestamp();
@@ -481,9 +663,11 @@ FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type IN ($3, $4)
-  AND ($5::bigint IS NULL OR user_id = $5)
-  AND ($6::text IS NULL OR model_name = $6)
-  AND ($7::bigint IS NULL OR channel_id = $7)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
   AND channel_id IS NOT NULL
 GROUP BY channel_id
 HAVING COUNT(*) > 0
@@ -491,9 +675,10 @@ ORDER BY total_requests DESC, output_tokens DESC
 LIMIT 300
 "#,
         cached = CACHE_TOKENS_EXPR,
-        real_input = REAL_INPUT_EXPR
+        real_input = build_real_input_expr(8),
     );
 
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
     let (log_rows, channel_map) = tokio::try_join!(
         async {
             sqlx::query_as::<_, ChannelLogStatsRow>(&sql)
@@ -501,9 +686,12 @@ LIMIT 300
                 .bind(end_ts)
                 .bind(LOG_TYPE_CONSUME)
                 .bind(LOG_TYPE_ERROR)
-                .bind(filter.user_id)
-                .bind(filter.model_name())
-                .bind(filter.channel_id)
+                .bind(filter.user_ids())
+                .bind(filter.model_names())
+                .bind(filter.channel_ids())
+                .bind(&ids)
+                .bind(filter.token_names())
+                .bind(filter.groups())
                 .fetch_all(log_pool)
                 .await
                 .map_err(AppError::from)
@@ -567,6 +755,7 @@ pub async fn fetch_model_stats(
     period_start_utc: DateTime<Utc>,
     period_end_utc: DateTime<Utc>,
     filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
 ) -> Result<Vec<ModelStatsItem>, AppError> {
     let start_ts = period_start_utc.timestamp();
     let end_ts = period_end_utc.timestamp();
@@ -586,26 +775,32 @@ FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type IN ($3, $4)
-  AND ($5::bigint IS NULL OR user_id = $5)
-  AND ($6::text IS NULL OR model_name = $6)
-  AND ($7::bigint IS NULL OR channel_id = $7)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
   AND model_name IS NOT NULL AND model_name <> ''
 GROUP BY model_name
 ORDER BY total_requests DESC, output_tokens DESC
 LIMIT 300
 "#,
         cached = CACHE_TOKENS_EXPR,
-        real_input = REAL_INPUT_EXPR
+        real_input = build_real_input_expr(8),
     );
 
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
     let rows = sqlx::query_as::<_, ModelStatsRow>(&sql)
         .bind(start_ts)
         .bind(end_ts)
         .bind(LOG_TYPE_CONSUME)
         .bind(LOG_TYPE_ERROR)
-        .bind(filter.user_id)
-        .bind(filter.model_name())
-        .bind(filter.channel_id)
+        .bind(filter.user_ids())
+        .bind(filter.model_names())
+        .bind(filter.channel_ids())
+        .bind(&ids)
+        .bind(filter.token_names())
+        .bind(filter.groups())
         .fetch_all(log_pool)
         .await?;
 
@@ -653,6 +848,7 @@ pub async fn fetch_raw_model_stats(
     period_start_utc: DateTime<Utc>,
     period_end_utc: DateTime<Utc>,
     filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
 ) -> Result<Vec<RawModelStatsItem>, AppError> {
     let start_ts = period_start_utc.timestamp();
     let end_ts = period_end_utc.timestamp();
@@ -673,9 +869,11 @@ FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type IN ($3, $4)
-  AND ($5::bigint IS NULL OR user_id = $5)
-  AND ($6::text IS NULL OR model_name = $6)
-  AND ($7::bigint IS NULL OR channel_id = $7)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
   AND model_name IS NOT NULL AND model_name <> ''
   AND channel_id IS NOT NULL
 GROUP BY model_name, channel_id
@@ -683,9 +881,10 @@ ORDER BY total_requests DESC, output_tokens DESC
 LIMIT 500
 "#,
         cached = CACHE_TOKENS_EXPR,
-        real_input = REAL_INPUT_EXPR
+        real_input = build_real_input_expr(8),
     );
 
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
     let (log_rows, channel_map) = tokio::try_join!(
         async {
             sqlx::query_as::<_, RawModelLogStatsRow>(&sql)
@@ -693,9 +892,12 @@ LIMIT 500
                 .bind(end_ts)
                 .bind(LOG_TYPE_CONSUME)
                 .bind(LOG_TYPE_ERROR)
-                .bind(filter.user_id)
-                .bind(filter.model_name())
-                .bind(filter.channel_id)
+                .bind(filter.user_ids())
+                .bind(filter.model_names())
+                .bind(filter.channel_ids())
+                .bind(&ids)
+                .bind(filter.token_names())
+                .bind(filter.groups())
                 .fetch_all(log_pool)
                 .await
                 .map_err(AppError::from)
@@ -765,9 +967,11 @@ WITH channel_perf AS (
     WHERE l.created_at >= $1
       AND l.created_at < $2
       AND l.type = $3
-      AND ($4::bigint IS NULL OR l.user_id = $4)
-      AND ($5::text IS NULL OR l.model_name = $5)
-      AND ($6::bigint IS NULL OR l.channel_id = $6)
+      AND ($4::bigint[] IS NULL OR l.user_id = ANY($4::bigint[]))
+      AND ($5::text[] IS NULL OR l.model_name = ANY($5::text[]))
+      AND ($6::bigint[] IS NULL OR l.channel_id = ANY($6::bigint[]))
+      AND ($7::text[] IS NULL OR l.token_name = ANY($7::text[]))
+      AND ($8::text[] IS NULL OR l."group" = ANY($8::text[]))
       AND l.channel_id IS NOT NULL
       AND l.use_time > 0
       AND l.completion_tokens > 0
@@ -787,9 +991,11 @@ LIMIT 5
     .bind(start_ts)
     .bind(end_ts)
     .bind(LOG_TYPE_CONSUME)
-    .bind(filter.user_id)
-    .bind(filter.model_name())
-    .bind(filter.channel_id)
+    .bind(filter.user_ids())
+    .bind(filter.model_names())
+    .bind(filter.channel_ids())
+    .bind(filter.token_names())
+    .bind(filter.groups())
     .fetch_all(log_pool)
     .await?;
 
@@ -836,9 +1042,11 @@ FROM logs
 WHERE created_at >= $1
   AND created_at < $2
   AND type = $3
-  AND ($4::bigint IS NULL OR user_id = $4)
-  AND ($5::text IS NULL OR model_name = $5)
-  AND ($6::bigint IS NULL OR channel_id = $6)
+  AND ($4::bigint[] IS NULL OR user_id = ANY($4::bigint[]))
+  AND ($5::text[] IS NULL OR model_name = ANY($5::text[]))
+  AND ($6::bigint[] IS NULL OR channel_id = ANY($6::bigint[]))
+  AND ($7::text[] IS NULL OR token_name = ANY($7::text[]))
+  AND ($8::text[] IS NULL OR "group" = ANY($8::text[]))
   AND model_name IS NOT NULL AND model_name <> ''
 GROUP BY model_name
 ORDER BY total_requests DESC
@@ -848,9 +1056,11 @@ LIMIT 5
     .bind(start_ts)
     .bind(end_ts)
     .bind(LOG_TYPE_CONSUME)
-    .bind(filter.user_id)
-    .bind(filter.model_name())
-    .bind(filter.channel_id)
+    .bind(filter.user_ids())
+    .bind(filter.model_names())
+    .bind(filter.channel_ids())
+    .bind(filter.token_names())
+    .bind(filter.groups())
     .fetch_all(log_pool)
     .await?;
 
@@ -885,4 +1095,158 @@ pub async fn fetch_extra_stats(
         top_throughput_channels,
         top_requested_models,
     })
+}
+
+// ── Timeseries ──
+
+#[derive(Debug, Clone, Copy)]
+pub enum Granularity {
+    Hour,
+    Day,
+}
+
+#[derive(Debug, FromRow)]
+struct TimeseriesRow {
+    bucket_ts: i64,
+    request_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_tokens: i64,
+    avg_latency_ms: Option<f64>,
+}
+
+pub async fn fetch_timeseries(
+    log_pool: &PgPool,
+    period_start_utc: DateTime<Utc>,
+    period_end_utc: DateTime<Utc>,
+    filter: StatsFilter,
+    openrouter_ids: &HashSet<i64>,
+    granularity: Granularity,
+) -> Result<Vec<TimeseriesPoint>, AppError> {
+    let start_ts = period_start_utc.timestamp();
+    let end_ts = period_end_utc.timestamp();
+
+    let divisor: i64 = match granularity {
+        Granularity::Hour => 3600,
+        Granularity::Day => 86400,
+    };
+
+    let sql = format!(
+        r#"
+SELECT
+    FLOOR(created_at / {divisor})::bigint * {divisor} AS bucket_ts,
+    COUNT(*)::bigint AS request_count,
+    COALESCE(SUM({real_input}) FILTER (WHERE type = $3), 0)::bigint AS input_tokens,
+    COALESCE(SUM(completion_tokens) FILTER (WHERE type = $3), 0)::bigint AS output_tokens,
+    COALESCE(SUM({cached}) FILTER (WHERE type = $3), 0)::bigint AS cached_tokens,
+    AVG(use_time * 1000.0) FILTER (WHERE type = $3 AND use_time > 0)::double precision AS avg_latency_ms
+FROM logs
+WHERE created_at >= $1
+  AND created_at < $2
+  AND type IN ($3, $4)
+  AND ($5::bigint[] IS NULL OR user_id = ANY($5::bigint[]))
+  AND ($6::text[] IS NULL OR model_name = ANY($6::text[]))
+  AND ($7::bigint[] IS NULL OR channel_id = ANY($7::bigint[]))
+  AND ($9::text[] IS NULL OR token_name = ANY($9::text[]))
+  AND ($10::text[] IS NULL OR "group" = ANY($10::text[]))
+GROUP BY bucket_ts
+ORDER BY bucket_ts
+LIMIT 1000
+"#,
+        divisor = divisor,
+        cached = CACHE_TOKENS_EXPR,
+        real_input = build_real_input_expr(8),
+    );
+
+    let ids: Vec<i64> = openrouter_ids.iter().copied().collect();
+    let rows = sqlx::query_as::<_, TimeseriesRow>(&sql)
+        .bind(start_ts)
+        .bind(end_ts)
+        .bind(LOG_TYPE_CONSUME)
+        .bind(LOG_TYPE_ERROR)
+        .bind(filter.user_ids())
+        .bind(filter.model_names())
+        .bind(filter.channel_ids())
+        .bind(&ids)
+        .bind(filter.token_names())
+        .bind(filter.groups())
+        .fetch_all(log_pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TimeseriesPoint {
+            bucket_ts: row.bucket_ts,
+            request_count: row.request_count,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_tokens: row.cached_tokens,
+            avg_latency_ms: row.avg_latency_ms,
+        })
+        .collect())
+}
+
+// ── Perf Metrics ──
+// Reads from main DB pool (perf_metrics is in the new-api main schema).
+
+#[derive(Debug, FromRow)]
+struct PerfMetricRow {
+    model_name: String,
+    request_count: i64,
+    success_count: i64,
+    avg_latency_ms: Option<f64>,
+    avg_ttft_ms: Option<f64>,
+    output_tokens: i64,
+    generation_speed_tps: Option<f64>,
+}
+
+pub async fn fetch_perf_metrics(
+    pool: &PgPool,
+    period_start_utc: DateTime<Utc>,
+    period_end_utc: DateTime<Utc>,
+) -> Result<Vec<PerfMetricStats>, AppError> {
+    let start_ts = period_start_utc.timestamp();
+    let end_ts = period_end_utc.timestamp();
+
+    let rows = sqlx::query_as::<_, PerfMetricRow>(
+        r#"
+SELECT
+    model_name,
+    SUM(request_count)::bigint AS request_count,
+    SUM(success_count)::bigint AS success_count,
+    SUM(total_latency_ms)::double precision / NULLIF(SUM(request_count), 0) AS avg_latency_ms,
+    SUM(ttft_sum_ms)::double precision / NULLIF(SUM(ttft_count), 0) AS avg_ttft_ms,
+    SUM(output_tokens)::bigint AS output_tokens,
+    SUM(output_tokens)::double precision / NULLIF(SUM(generation_ms)::double precision / 1000.0, 0) AS generation_speed_tps
+FROM perf_metrics
+WHERE bucket_ts >= $1 AND bucket_ts < $2
+GROUP BY model_name
+HAVING SUM(request_count) > 0
+ORDER BY SUM(request_count) DESC
+"#,
+    )
+    .bind(start_ts)
+    .bind(end_ts)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let success_rate = if row.request_count > 0 {
+                ((row.success_count as f64 / row.request_count as f64) * 10000.0).round() / 100.0
+            } else {
+                0.0
+            };
+            PerfMetricStats {
+                model_name: row.model_name,
+                request_count: row.request_count,
+                success_rate,
+                avg_latency_ms: row.avg_latency_ms,
+                avg_ttft_ms: row.avg_ttft_ms,
+                output_tokens: row.output_tokens,
+                generation_speed_tps: row.generation_speed_tps,
+            }
+        })
+        .collect())
 }
